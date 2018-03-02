@@ -16,21 +16,25 @@
 
 //! Fetching
 
-use std::{io, fmt, time};
+use std::cmp::min;
+use std::{io, error, fmt, mem};
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicBool};
+use std::thread;
+use std::time::Duration;
 
-use futures::{self, Future, Async};
-use futures_cpupool::{CpuPool, CpuFuture};
-use parking_lot::RwLock;
+use futures::{self, Future, Async, Sink, Stream};
+use futures::future::{self, Either};
+use futures_cpupool::CpuPool;
+use futures::sync::{mpsc, oneshot};
+use parking_lot::{Condvar, Mutex};
 
 use hyper::{self, Request, Method, StatusCode, Uri};
-use hyper::client::FutureResponse;
 use hyper::header::{UserAgent, ContentType};
 use hyper::mime::Mime;
 
 use hyper_rustls;
-use tokio_core;
+use tokio_core::reactor;
 
 type BoxFuture<A, B> = Box<Future<Item = A, Error = B> + Send>;
 
@@ -56,29 +60,19 @@ pub trait Fetch: Clone + Send + Sync + 'static {
 	/// Result type
 	type Result: Future<Item=Response, Error=Error> + Send + 'static;
 
-	/// Creates new Fetch object.
-	fn new() -> Result<Self, Error> where Self: Sized;
-
 	/// Spawn the future in context of this `Fetch` thread pool.
-	/// Implementation is optional.
-	fn process<F, I, E>(&self, f: F) -> BoxFuture<I, E> where
-		F: Future<Item=I, Error=E> + Send + 'static,
-		I: Send + 'static,
-		E: Send + 'static,
-	{
-		Box::new(f)
-	}
+	fn process<F, I, E>(&self, f: F) -> BoxFuture<I, E>
+		where F: Future<Item=I, Error=E> + Send + 'static,
+			  I: Send + 'static,
+			  E: Send + 'static;
 
-	/// Spawn the future in context of this `Fetch` thread pool as "fire and forget", i.e. dropping this future without
-	/// canceling the underlying future.
-	/// Implementation is optional.
-	fn process_and_forget<F, I, E>(&self, _: F) where
-		F: Future<Item=I, Error=E> + Send + 'static,
-		I: Send + 'static,
-		E: Send + 'static,
-	{
-		panic!("Attempting to process and forget future on unsupported Fetch.");
-	}
+	/// Spawn the future in context of this `Fetch` thread pool as
+	/// "fire and forget", i.e. dropping this future without canceling
+	/// the underlying future.
+	fn process_and_forget<F, I, E>(&self, f: F)
+		where F: Future<Item=I, Error=E> + Send + 'static,
+			  I: Send + 'static,
+			  E: Send + 'static;
 
 	/// Fetch URL and get a future for the result.
 	/// Supports aborting the request in the middle of execution.
@@ -88,71 +82,140 @@ pub trait Fetch: Clone + Send + Sync + 'static {
 	fn fetch(&self, url: &str) -> Self::Result {
 		self.fetch_with_abort(url, Default::default())
 	}
-
-	/// Fetch URL and get the result synchronously.
-	fn fetch_sync(&self, url: &str) -> Result<Response, Error> {
-		self.fetch(url).wait()
-	}
-
-	/// Closes this client
-	fn close(self) where Self: Sized {}
 }
 
+const THREAD_NAME: &str = "fetch";
 const CLIENT_TIMEOUT_SECONDS: u64 = 5;
 
-type HyperClient = hyper::Client<hyper_rustls::HttpsConnector>;
+type TxResponse  = oneshot::Sender<Result<hyper::Response, hyper::error::Error>>;
+type RxResponse  = oneshot::Receiver<Result<hyper::Response, hyper::error::Error>>;
+type StartupCond = Arc<(Mutex<Result<(), io::Error>>, Condvar)>;
 
-/// Fetch client
-pub struct Client {
-	client: RwLock<Arc<HyperClient>>,
-	pool: CpuPool,
-	limit: Option<usize>,
+// `Proto`col values are sent over an mpsc channel from clients to
+// their shared background thread with a tokio core and hyper cient inside.
+enum Proto {
+	Request(hyper::Request, TxResponse),
+	Quit // terminates background thread
 }
 
-impl Clone for Client {
-	fn clone(&self) -> Self {
-		let client = *self.client.read();
-		Client {
-			client: RwLock::new(client.clone()),
-			pool: self.pool.clone(),
-			limit: self.limit.clone(),
-		}
+impl Proto {
+	fn is_quit(&self) -> bool {
+		if let Proto::Quit = *self { true } else { false }
 	}
+}
+
+/// Fetch client
+#[derive(Clone)]
+pub struct Client {
+	pool:     CpuPool,
+	tx_proto: mpsc::Sender<Proto>,
+	limit:    Option<usize>
 }
 
 impl Client {
-	fn new_client() -> Result<Arc<HyperClient>, Error> {
-		let mut core = tokio_core::reactor::Core::new()?;
-		let mut client = hyper::Client::configure()
-			.connector(hyper_rustls::HttpsConnector::new(4, &core.handle()));
-		// TODO [kirushik] Now it's no longer following redirects automatically
-		Ok(Arc::new(client.build(&core.handle())))
-	}
+	/// Create a new client which spins up a separate thread running a
+	/// tokio `Core` and a `hyper::Client`.
+	/// Clones of this client share the same background thread.
+	pub fn new() -> Result<Self, Error> {
+		let startup_done = Arc::new((Mutex::new(Ok(())), Condvar::new()));
+		let (tx_proto, rx_proto) = mpsc::channel(64);
 
-	fn with_limit(limit: Option<usize>) -> Result<Self, Error> {
+		Client::background_thread(startup_done.clone(), rx_proto)?;
+
+		let mut guard = startup_done.0.lock();
+		let startup_result = startup_done.1.wait_for(&mut guard, Duration::from_secs(3));
+
+		if startup_result.timed_out() {
+			error!(target: "fetch", "timeout starting {}", THREAD_NAME);
+			return Err(Error::Other("timeout starting background thread".into()))
+		}
+		if let Err(e) = mem::replace(&mut *guard, Ok(())) {
+			error!(target: "fetch", "error starting background thread: {}", e);
+			return Err(e.into())
+		}
+
+		// TODO: Add support for following redirects.
 		Ok(Client {
-			client: RwLock::new(Self::new_client()?),
-			pool: CpuPool::new(4),
-			limit: limit,
+			pool:     CpuPool::new(4),
+			tx_proto: tx_proto,
+			limit:    Some(64 * 1024 * 1024)
 		})
 	}
 
-	/// Sets a limit on the maximum download size.
-	pub fn set_limit(&mut self, limit: Option<usize>) {
-		self.limit = limit
+	fn background_thread(start: StartupCond, rx_proto: mpsc::Receiver<Proto>) -> io::Result<thread::JoinHandle<()>> {
+		thread::Builder::new().name(THREAD_NAME.into()).spawn(move || {
+			let mut core = match reactor::Core::new() {
+				Ok(c)  => c,
+				Err(e) => {
+					*start.0.lock() = Err(e);
+					start.1.notify_one();
+					return ()
+				}
+			};
+			let handle = core.handle();
+			let client = hyper::Client::configure()
+				.connector(hyper_rustls::HttpsConnector::new(4, &core.handle()))
+				.build(&core.handle());
+
+			start.1.notify_one();
+			debug!(target: "fetch", "processing requests ...");
+
+			let work = rx_proto.take_while(|item| Ok(!item.is_quit())).for_each(|item| {
+				if let Proto::Request(rq, sender) = item {
+					trace!(target: "fetch", "new request");
+					let maxdur = Duration::from_secs(CLIENT_TIMEOUT_SECONDS);
+					let timeout = match reactor::Timeout::new(maxdur, &handle) {
+						Ok(t)  => t,
+						Err(e) => {
+							error!(target: "fetch", "failed to create timeout: {}.", e);
+							return future::err(())
+						}
+					};
+					let future = client.request(rq).select2(timeout).then(|rs| {
+						trace!(target: "fetch", "request finished");
+						// When sending responses back over the oneshot channels, we treat
+						// the possibility that the other end is gone as normal, hence we
+						// use `unwrap_or(())` and do not error.
+						match rs {
+							Ok(Either::A((r, _)))    => sender.send(Ok(r)).unwrap_or(()),
+							Ok(Either::B((_, _)))    => {
+								let err = io::Error::new(io::ErrorKind::TimedOut, "timeout");
+								sender.send(Err(hyper::Error::Io(err))).unwrap_or(())
+							}
+							Err(Either::A((err, _))) => sender.send(Err(err)).unwrap_or(()),
+							Err(Either::B((err, _))) => sender.send(Err(err.into())).unwrap_or(()),
+						}
+						future::ok(())
+					});
+					handle.spawn(future);
+					trace!(target: "fetch", "waiting for next request...")
+				}
+				future::ok(())
+			});
+			if let Err(()) = core.run(work) {
+				error!(target: "fetch", "error while executing future")
+			}
+			debug!(target: "fetch", "{} background thread finished", THREAD_NAME)
+		})
 	}
 
-	fn client(&self) -> Result<Arc<HyperClient>, Error> {
-		{
-			let (ref time, ref client) = *self.client.read();
-			if time.elapsed() < time::Duration::from_secs(CLIENT_TIMEOUT_SECONDS) {
-				return Ok(client.clone());
-			}
-		}
+	/// Close this client by shutting down the background thread.
+	///
+	/// Please note that this will affect all clones of this `Client` as they all
+	/// share the same background thread.
+	pub fn close(self) -> Result<(), Error> {
+		self.tx_proto.clone().send(Proto::Quit).wait()
+			.map_err(|e| {
+				error!(target: "fetch", "failed to send quit to background thread: {}", e);
+				// We can not put `e: SendError<Proto>` into `Other` as it is not `Send`.
+				Error::Other("failed to terminate background thread".into())
+			})?;
+		Ok(())
+	}
 
-		let client = Self::new_client()?;
-		*self.client.write() = (time::Instant::now(), client.clone());
-		Ok(client)
+	/// (Un-)set size limit on response body.
+	pub fn set_limit(&mut self, limit: Option<usize>) {
+		self.limit = limit;
 	}
 
 	/// Returns a handle to underlying CpuPool of this client.
@@ -162,134 +225,153 @@ impl Client {
 }
 
 impl Fetch for Client {
-	type Result = CpuFuture<Response, Error>;
+	type Result = BoxFuture<Response, Error>;
 
-	fn new() -> Result<Self, Error> {
-		// Max 64MB will be downloaded.
-		Self::with_limit(Some(64 * 1024 * 1024))
+	fn fetch_with_abort(&self, url: &str, abort: Abort) -> Self::Result {
+		debug!(target: "fetch", "fetching: {:?}", url);
+
+		let url: Uri = match url.parse() {
+			Ok(u)  => u,
+			Err(e) => return Box::new(futures::future::err(e.into()))
+		};
+
+		let mut rq = Request::new(Method::Get, url.clone());
+		rq.headers_mut().set(UserAgent::new("Parity Fetch Neo"));
+
+		let sender = self.tx_proto.clone();
+		let limit  = self.limit.clone();
+		let pool   = self.pool.clone();
+		let future = self.pool.spawn_fn(move || {
+			let (tx_res, rx_res) = oneshot::channel();
+			sender.send(Proto::Request(rq, tx_res)).map(|_| rx_res)
+		})
+		.map_err(|e| {
+			error!(target: "fetch", "failed to schedule request: {}", e);
+			Error::Other("failed to schedule request".into())
+		})
+		.and_then(move |rx_res| {
+			pool.spawn(FetchTask {
+				url: url,
+				rx_res: rx_res,
+				limit: limit,
+				abort: abort
+			})
+		});
+		Box::new(future)
 	}
 
-	fn process<F, I, E>(&self, f: F) -> BoxFuture<I, E> where
-		F: Future<Item=I, Error=E> + Send + 'static,
-		I: Send + 'static,
-		E: Send + 'static,
+	fn process<F, I, E>(&self, f: F) -> BoxFuture<I, E>
+		where F: Future<Item=I, Error=E> + Send + 'static,
+			  I: Send + 'static,
+			  E: Send + 'static
 	{
 		Box::new(self.pool.spawn(f))
 	}
 
-	fn process_and_forget<F, I, E>(&self, f: F) where
-		F: Future<Item=I, Error=E> + Send + 'static,
-		I: Send + 'static,
-		E: Send + 'static,
+	fn process_and_forget<F, I, E>(&self, f: F)
+		where F: Future<Item=I, Error=E> + Send + 'static,
+			  I: Send + 'static,
+			  E: Send + 'static
 	{
 		self.pool.spawn(f).forget()
-	}
-
-	fn fetch_with_abort(&self, url: &str, abort: Abort) -> Self::Result {
-		debug!(target: "fetch", "Fetching from: {:?}", url);
-		let url: Uri = match url.parse() {
-			Ok(url) => url,
-			Err(err) => return self.pool.spawn(futures::future::err(err.into()))
-		};
-
-		trace!(target: "fetch", "Starting fetch task: {:?}", self.url);
-		let mut request = Request::new(Method::Get, self.url);
-		request.headers_mut().set(UserAgent::new("Parity Fetch Neo"));
-
-		match self.client() {
-			Ok(client) => {
-				self.pool.spawn(FetchTask {
-					url: url,
-					response: client.request(request),
-					limit: self.limit,
-					abort: abort,
-				})
-			},
-			Err(err) => {
-				self.pool.spawn(futures::future::err(err))
-			},
-		}
 	}
 }
 
 struct FetchTask {
-	url: Uri,
-	response: FutureResponse,
-	limit: Option<usize>,
-	abort: Abort,
+	url:    Uri,
+	rx_res: RxResponse,
+	limit:  Option<usize>,
+	abort:  Abort
 }
 
 impl Future for FetchTask {
-	// TODO [ToDr] timeouts handling?
 	type Item = Response;
 	type Error = Error;
 
 	fn poll(&mut self) -> futures::Poll<Self::Item, Self::Error> {
 		if self.abort.is_aborted() {
-			trace!(target: "fetch", "Fetch of {:?} aborted.", self.url);
+			debug!(target: "fetch", "Fetch of {:?} aborted.", self.url);
 			return Err(Error::Aborted);
 		}
-
-		match self.response.poll()? {
-			Async::Ready(response) => Ok(Async::Ready(response.into())),
+		match self.rx_res.poll()? {
+			Async::Ready(Err(e)) => Err(e.into()),
+			Async::Ready(Ok(r))  => {
+				let ctype = r.headers().get::<ContentType>().cloned();
+				Ok(Async::Ready(Response {
+					inner: ResponseInner::Response(r.status(), ctype, BodyReader::new(r.body())),
+					abort: self.abort.clone(),
+					limit: self.limit.clone(),
+					read:  0
+				}))
+			}
 			Async::NotReady => Ok(Async::NotReady)
 		}
-
 	}
 }
 
-/// Fetch Error
+/// Fetch related error cases.
 #[derive(Debug)]
 pub enum Error {
-	/// Internal fetch error
-	Fetch(hyper::Error),
-	/// IO error, from tokio core
-	IO(io::Error),
+	/// Error produced by hyper.
+	Hyper(hyper::Error),
+	/// I/O error
+	Io(io::Error),
 	/// URI parse error
-	URI(hyper::error::UriError),
+	Uri(hyper::error::UriError),
 	/// Request aborted
 	Aborted,
+	/// Some other error
+	Other(Box<error::Error + Send + Sync + 'static>)
 }
 
 impl fmt::Display for Error {
 	fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
-			Error::Aborted => write!(fmt, "The request has been aborted."),
-			Error::Fetch(ref err) => write!(fmt, "{}", err),
+			Error::Aborted      => write!(fmt, "The request has been aborted."),
+			Error::Hyper(ref e) => write!(fmt, "{}", e),
+			Error::Uri(ref e)   => write!(fmt, "{}", e),
+			Error::Io(ref e)    => write!(fmt, "{}", e),
+			Error::Other(ref e) => write!(fmt, "{}", e)
 		}
 	}
 }
 
+impl From<oneshot::Canceled> for Error {
+	fn from(e: oneshot::Canceled) -> Self {
+		Error::Other(e.into())
+	}
+}
+
 impl From<hyper::Error> for Error {
-	fn from(error: hyper::Error) -> Self {
-		Error::Fetch(error)
+	fn from(e: hyper::Error) -> Self {
+		Error::Hyper(e)
 	}
 }
 
 impl From<io::Error> for Error {
-	fn from(error: io::Error) -> Self {
-		Error::IO(error)
+	fn from(e: io::Error) -> Self {
+		Error::Io(e)
 	}
 }
 
 impl From<hyper::error::UriError> for Error {
-	fn from(error: hyper::error::UriError) -> Self {
-		Error::URI(error)
+	fn from(e: hyper::error::UriError) -> Self {
+		Error::Uri(e)
 	}
 }
 
 enum ResponseInner {
-	Response(hyper::Response),
+	Response(hyper::StatusCode, Option<ContentType>, BodyReader),
 	Reader(Box<io::Read + Send>),
-	NotFound,
+	NotFound
 }
 
 impl fmt::Debug for ResponseInner {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
-			ResponseInner::Response(ref response) => response.fmt(f),
-			ResponseInner::NotFound => write!(f, "Not found"),
-			ResponseInner::Reader(_) => write!(f, "io Reader"),
+			ResponseInner::Response(s, ..) => write!(f, "hyper response (status={})", s),
+			ResponseInner::NotFound        => write!(f, "not found"),
+			ResponseInner::Reader(_)       => write!(f, "io reader"),
 		}
 	}
 }
@@ -300,7 +382,7 @@ pub struct Response {
 	inner: ResponseInner,
 	abort: Abort,
 	limit: Option<usize>,
-	read: usize,
+	read:  usize
 }
 
 impl Response {
@@ -310,7 +392,7 @@ impl Response {
 			inner: ResponseInner::Reader(Box::new(reader)),
 			abort: Abort::default(),
 			limit: None,
-			read: 0,
+			read:  0
 		}
 	}
 
@@ -320,16 +402,16 @@ impl Response {
 			inner: ResponseInner::NotFound,
 			abort: Abort::default(),
 			limit: None,
-			read: 0,
+			read:  0
 		}
 	}
 
 	/// Returns status code of this response.
 	pub fn status(&self) -> StatusCode {
 		match self.inner {
-			ResponseInner::Response(ref r) => r.status(),
-			ResponseInner::NotFound => StatusCode::NotFound,
-			_ => StatusCode::Ok,
+			ResponseInner::Response(s, ..) => s,
+			ResponseInner::NotFound        => StatusCode::NotFound,
+			_                              => StatusCode::Ok
 		}
 	}
 
@@ -340,27 +422,20 @@ impl Response {
 
 	/// Returns `true` if content type of this response is `text/html`
 	pub fn is_html(&self) -> bool {
-		match self.content_type() {
-			Some(ref mime) if mime.type_() == "text" && mime.subtype() == "html" => true,
-			_ => false,
+		if let Some(ref mime) = self.content_type() {
+			mime.type_() == "text" && mime.subtype() == "html"
+		} else {
+			false
 		}
 	}
 
 	/// Returns content type of this response (if present)
 	pub fn content_type(&self) -> Option<Mime> {
-		match self.inner {
-			ResponseInner::Response(ref r) => {
-				let content_type = r.headers().get::<ContentType>();
-				content_type.map(|mime| mime.0.clone())
-			},
-			_ => None,
+		if let ResponseInner::Response(_, ref c, _) = self.inner {
+			c.as_ref().map(|mime| mime.0.clone())
+		} else {
+			None
 		}
-	}
-}
-
-impl From<hyper::Response> for Response {
-	fn from(response: hyper::Response) -> Self {
-		unimplemented!()
 	}
 }
 
@@ -371,38 +446,96 @@ impl io::Read for Response {
 		}
 
 		let res = match self.inner {
-			ResponseInner::Response(ref mut response) => response.read(buf),
-			ResponseInner::NotFound => return Ok(0),
-			ResponseInner::Reader(ref mut reader) => reader.read(buf),
+			ResponseInner::Response(_, _, ref mut r) => r.read(buf),
+			ResponseInner::NotFound                  => return Ok(0),
+			ResponseInner::Reader(ref mut r)         => r.read(buf)
 		};
 
 		// increase bytes read
 		if let Ok(read) = res {
-			self.read += read;
+			self.read += read
 		}
 
 		// check limit
 		match self.limit {
 			Some(limit) if limit < self.read => {
 				return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Size limit reached."));
-			},
-			_ => {},
+			}
+			_ => {}
 		}
 
 		res
 	}
 }
 
+// `BodyReader` serves as a bridge from async to sync I/O. It implements
+// `io::Read` by repedately waiting for the next `Chunk` of hyper's response `Body`.
+struct BodyReader {
+	chunk:  hyper::Chunk,
+	body:   Option<hyper::Body>,
+	offset: usize
+}
+
+impl BodyReader {
+	fn new(b: hyper::Body) -> BodyReader {
+		BodyReader { body: Some(b), chunk: Default::default(), offset: 0 }
+	}
+}
+
+impl io::Read for BodyReader {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		let mut m = 0;
+		while self.body.is_some() {
+			// Can we still read from the current chunk?
+			if self.offset < self.chunk.len() {
+				let k = min(self.chunk.len() - self.offset, buf.len() - m);
+				let c = &self.chunk[self.offset .. self.offset + k];
+				(&mut buf[m .. m + k]).copy_from_slice(c);
+				self.offset += k;
+				m += k;
+				if m == buf.len() {
+					break
+				}
+			} else {
+				// While in this loop, `self.body` is always defined => wait for the next chunk.
+				match self.body.take().unwrap().into_future().wait() {
+					Err((e, _))   => {
+						error!(target: "fetch", "failed to read chunk: {}", e);
+						return Err(io::Error::new(io::ErrorKind::Other, "failed to read body chunk"))
+					}
+					Ok((None,    _)) => break, // body is exhausted, break out of the loop
+					Ok((Some(c), b)) => {
+						self.body = Some(b);
+						self.chunk = c;
+						self.offset = 0
+					}
+				}
+			}
+		}
+		Ok(m)
+	}
+}
+
 #[cfg(test)]
 mod test {
 	use super::*;
+	use std::io::Read;
 
 	#[test]
 	fn it_should_fetch() {
 		let fetch = Client::new().unwrap();
-		let ya = fetch.fetch("https://ya.ru").wait();
-		assert!(ya.is_ok());
-		let ya_response = ya.unwrap();
-		assert!(ya_response.is_success());
+		let future_resp1 = fetch.fetch("https://github.com");
+		let future_resp2 = fetch.fetch("https://github.com");
+		let mut resp1 = future_resp1.wait().unwrap();
+		let mut resp2 = future_resp2.wait().unwrap();
+		println!("{:?}", resp1.status());
+		println!("{:?}", resp2.status());
+		let mut s = String::new();
+		resp1.read_to_string(&mut s).unwrap();
+		println!("{} bytes", s.len());
+		s.clear();
+		resp2.read_to_string(&mut s).unwrap();
+		println!("{} bytes", s.len());
+		fetch.close().unwrap()
 	}
 }
